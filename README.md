@@ -71,7 +71,7 @@ Your distribution's own packages are not replaced. Run `./install.sh --help` for
 
 ```bash
 fprintd-enroll      # touch the reader 10 times, moving your finger a little
-fprintd-verify      # each attempt takes about 2 seconds
+fprintd-verify      # a match usually takes about half a second
 ```
 
 Enable it for login, `sudo` and the lock screen (keep a root shell open while doing this):
@@ -170,9 +170,15 @@ A fingerprint here is a **convenience, not a strong security boundary**.
 - **Risk to the hardware:** this driver talks directly to an undocumented embedded
   controller and MCU. It has run without damage on one laptop, but there is **no
   warranty**, and it has no official recovery path if a sensor stops responding.
-- Each capture takes about 2 seconds, and the finger must stay still.
-- While waiting for a finger, the sensor is polled: about 565 interrupts per second and
-  0.4 % CPU in `fprintd` were measured.
+- A match usually takes about 0.5 s from touch to result, estimated from measured stages. Some
+  touches need a longer read, during which the finger must stay still: about 1.5 s, and
+  about 1.7 s for a rejection. Lifting the finger earlier can report that it was not centered.
+  Enrolling always reads the full image, which takes about 1.5 s per touch.
+- To be fast, verification accepts a partial image when the match is very strong. Those
+  thresholds are provisional and have only been checked with the fingers of one person.
+- While waiting for a finger, the sensor is polled. Together, the interrupt thread and
+  `fprintd` were measured at about 10 % of one CPU thread for the first 10 seconds and about
+  4 % afterwards, with about 240 interrupts per second.
 - Stability of the reference at other temperatures has not been measured. If
   recognition gets worse, run `sudo ./install.sh --recalibrate` with no finger on the reader.
 - The module has been rebuilt by DKMS on three installed kernels. A live kernel update
