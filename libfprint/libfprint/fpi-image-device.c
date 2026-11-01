@@ -310,7 +310,9 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
       if (priv->enroll_stage == fp_device_get_nr_enroll_stages (device))
         {
           fp_image_device_maybe_complete_action (self, g_steal_pointer (&error));
-          fpi_image_device_deactivate (self, FALSE);
+          /* SIGFM can finish before the finger is lifted. There is no need to wait for that:
+           * like a cancellation, this stops waiting for the finger to be removed. */
+          fpi_image_device_deactivate (self, TRUE);
         }
       else
         {

@@ -199,6 +199,7 @@ A fingerprint here is a **convenience, not a strong security boundary**.
 | Symptom | What to do |
 |---|---|
 | `Key was rejected by service` on `modprobe` | The Secure Boot key is not enrolled: run `sudo ./install.sh` again and complete the MOK screen |
+| `Authorization denied ... to call method 'Claim'` in the log while enrolling or deleting | Harmless. The password dialog also tries the reader, which is already in use, and falls back to the password |
 | `unsupported sensor` | Your reader is not MilanL. Nothing was written to it. Run `sudo ./uninstall.sh` |
 | `a finger seems to be on the sensor` | Lift your finger, clean the reader and try again |
 | Download of the driver package fails | Get the file named in the error from the [Microsoft Update Catalog](https://www.catalog.update.microsoft.com/Search.aspx?q=GXFP51B7) and use `--cab FILE` |
