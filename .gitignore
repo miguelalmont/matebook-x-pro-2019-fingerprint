@@ -1,0 +1,22 @@
+# Build output
+build/
+*.o
+*.ko
+*.ko.*
+*.mod
+*.mod.c
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Never commit keys, sensor calibration, vendor data or fingerprint captures
+*.priv
+*.der
+*.pem
+*.key
+*.bin
+*.cab
+*.dll
+*.pgm
+*.variant

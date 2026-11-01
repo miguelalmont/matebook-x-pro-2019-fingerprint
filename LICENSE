@@ -1,0 +1,12 @@
+This repository combines components under different licenses. Each file's SPDX
+header or directory rule below applies. The full texts are in LICENSES/.
+
+  kernel/                 GPL-2.0-only (uAPI header: GPL-2.0 WITH Linux-syscall-note)
+  libfprint/              LGPL-2.1-or-later, including the gxfpnav driver
+                          (see also libfprint/COPYING and the notices in each file)
+  tools/                  LGPL-2.1-or-later
+  src/, include/          MIT, from gxfpmoc (LICENSES/MIT-gxfpmoc.txt)
+  install.sh, uninstall.sh, packaging/, documentation
+                          MIT (LICENSES/MIT.txt)
+
+No Goodix or Huawei code or data is included. See NOTICE.md.

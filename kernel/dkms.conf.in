@@ -1,0 +1,6 @@
+PACKAGE_NAME="gxfp51b7"
+PACKAGE_VERSION="@VERSION@"
+BUILT_MODULE_NAME[0]="gxfp51b7"
+DEST_MODULE_LOCATION[0]="/extra"
+MAKE[0]="make KDIR=${kernel_source_dir} all"
+AUTOINSTALL="yes"

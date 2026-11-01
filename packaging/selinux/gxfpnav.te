@@ -1,0 +1,9 @@
+# The gxfp51b7 module requires CAP_SYS_RAWIO to open /dev/gxfp; fprintd_t lacks it.
+module gxfpnav 1.0;
+
+require {
+	type fprintd_t;
+	class capability sys_rawio;
+}
+
+allow fprintd_t self:capability sys_rawio;
