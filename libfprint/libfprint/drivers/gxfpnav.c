@@ -1,7 +1,9 @@
 /*
  * gxfpnav: Goodix GXFP51B7 (MilanL) over the EC mailbox, with images read through
  * cleartext NAV frames. It uses neither TLS nor a PSK, so the channel is not
- * authenticated. Images are read in a thread because a sweep blocks for about 2 s.
+ * authenticated. Images are read in a thread because a read blocks the sensor. To verify,
+ * reading stops as soon as a partial image matches a template with strong evidence; a
+ * rejection always comes from the full image and libfprint still makes the final decision.
  * Finger detection polls NAV: the Windows FDT flow has not been tested without TLS.
  *
  * Copyright (C) 2026 Miguel Almont
@@ -18,7 +20,10 @@
 
 #include "drivers_api.h"
 
+#include "../fp-print-private.h"
 #include "../fpi-image-device.h"
+#include "../fpi-print.h"
+#include "../sigfm/sigfm.hpp"
 
 #include "gxfpnav_core.h"
 
@@ -28,10 +33,15 @@
 
 #define GXFPNAV_ENROLL_SAMPLES 10
 #define GXFPNAV_DATA_DIR "/var/lib/fprint/gxfpnav"
-#define GXFPNAV_POLL_US 100000
+#define GXFPNAV_POLL_DOWN_US 20000
+#define GXFPNAV_POLL_UP_US 100000
 #define GXFPNAV_FINGER_DOWN (-200.0)	/* mean difference: about -500 counts with a finger */
 #define GXFPNAV_FINGER_UP (-80.0)
 #define GXFPNAV_DOWN_STABLE 2
+#define GXFPNAV_SETTLED_CORR 0.99	/* between frames: measured 0.93 at contact, 0.999 after */
+/* Provisional. SIGFM scores k coherent matches as about k^4/8: 94395 is 30, 1000 is 10. */
+#define GXFPNAV_ACCEPT_LEVEL1 94395
+#define GXFPNAV_ACCEPT_LEVEL2 1000
 
 enum gxfpnav_op {
   GXFPNAV_OP_NONE,
@@ -49,6 +59,8 @@ struct _FpiDeviceGxfpNav {
   GCancellable *cancellable;
   gboolean op_running;
   gboolean deactivating;
+  int image_height;
+  GPtrArray *templates;	/* borrowed SigfmImgInfo of the current action; NULL for a full read */
 
   /* Suspend: the operation stops before sleeping and is repeated on wake-up. */
   gboolean suspending;
@@ -70,11 +82,16 @@ static int
 gxfpnav_wait_finger (FpiDeviceGxfpNav *self, GCancellable *cancellable, gboolean down)
 {
   int stable = 0;
+  int r = down ? gxfpnav_detect_begin (&self->core) : 0;
+
+  if (r < 0)
+    return r;
 
   while (!g_cancellable_is_cancelled (cancellable))
     {
-      double delta = 0;
-      int r = gxfpnav_finger_delta (&self->core, &delta);
+      double delta = 0, corr = 0;
+
+      r = gxfpnav_finger_delta (&self->core, &delta, &corr);
 
       /* A damaged frame says nothing about the finger. */
       if (r == -EAGAIN)
@@ -86,12 +103,76 @@ gxfpnav_wait_finger (FpiDeviceGxfpNav *self, GCancellable *cancellable, gboolean
         stable++;
       else
         stable = 0;
-      if (stable >= (down ? GXFPNAV_DOWN_STABLE : 1))
-        return 0;
+      if (down ? (stable >= GXFPNAV_DOWN_STABLE && corr >= GXFPNAV_SETTLED_CORR) : stable >= 1)
+        {
+          fp_dbg ("finger %s: delta=%.1f, corr=%.4f", down ? "down" : "up", delta, corr);
+          return 0;
+        }
 
-      g_usleep (GXFPNAV_POLL_US);
+      g_usleep (down ? GXFPNAV_POLL_DOWN_US : GXFPNAV_POLL_UP_US);
     }
   return -ECANCELED;
+}
+
+/* Same argument order as fpi_print_sigfm_match: the score is not symmetric. */
+static int
+gxfpnav_accept_partial (const uint8_t *img, int width, int height, int level, void *ctx)
+{
+  GPtrArray *templates = ctx;
+  int min_score = level == 1 ? GXFPNAV_ACCEPT_LEVEL1 : GXFPNAV_ACCEPT_LEVEL2;
+  SigfmImgInfo *probe = sigfm_extract (img, width, height);
+  int accepted = 0;
+
+  for (guint i = 0; probe && !accepted && i < templates->len; i++)
+    accepted = sigfm_match_score_limit (g_ptr_array_index (templates, i), probe, min_score) >= min_score;
+  fp_dbg ("partial image, level %d, %dx%d: %s", level, width, height, accepted ? "accepted" : "reading on");
+  if (probe)
+    sigfm_free_info (probe);
+  return accepted;
+}
+
+static void
+gxfpnav_collect_print (GPtrArray *out, FpPrint *print)
+{
+  if (print->type != FPI_PRINT_SIGFM || !print->prints)
+    return;
+  for (guint i = 0; i < print->prints->len; i++)
+    g_ptr_array_add (out, g_ptr_array_index (print->prints, i));
+}
+
+/* Runs in the main thread. Enrolment and raw capture always read the full image. */
+static void
+gxfpnav_collect_templates (FpiDeviceGxfpNav *self)
+{
+  FpDevice *device = FP_DEVICE (self);
+  FpiDeviceAction action = fpi_device_get_current_action (device);
+  GPtrArray *out;
+
+  g_clear_pointer (&self->templates, g_ptr_array_unref);
+  if (action != FPI_DEVICE_ACTION_VERIFY && action != FPI_DEVICE_ACTION_IDENTIFY)
+    return;
+
+  out = g_ptr_array_new ();
+  if (action == FPI_DEVICE_ACTION_VERIFY)
+    {
+      FpPrint *print = NULL;
+
+      fpi_device_get_verify_data (device, &print);
+      if (print)
+        gxfpnav_collect_print (out, print);
+    }
+  else
+    {
+      GPtrArray *prints = NULL;
+
+      fpi_device_get_identify_data (device, &prints);
+      for (guint i = 0; prints && i < prints->len; i++)
+        gxfpnav_collect_print (out, g_ptr_array_index (prints, i));
+    }
+  if (out->len)
+    self->templates = out;
+  else
+    g_ptr_array_unref (out);
 }
 
 static void
@@ -126,8 +207,10 @@ gxfpnav_op_thread (GTask *task, gpointer source, gpointer task_data, GCancellabl
       break;
 
     case GXFPNAV_OP_CAPTURE:
-      r = gxfpnav_capture (&self->core, self->image, &overlap, gxfpnav_is_cancelled, cancellable);
-      fp_dbg ("capture: r=%d, overlap=%.3f", r, overlap);
+      r = gxfpnav_capture (&self->core, self->image, &self->image_height, &overlap,
+                           self->templates ? gxfpnav_accept_partial : NULL, self->templates,
+                           gxfpnav_is_cancelled, cancellable);
+      fp_dbg ("capture: r=%d, height=%d, overlap=%.3f", r, self->image_height, overlap);
       break;
 
     case GXFPNAV_OP_NONE:
@@ -154,6 +237,8 @@ gxfpnav_op_done (GObject *source, GAsyncResult *result, gpointer user_data)
   int r = (int) g_task_propagate_int (G_TASK (result), NULL);
 
   self->op_running = FALSE;
+  if (op == GXFPNAV_OP_CAPTURE)
+    g_clear_pointer (&self->templates, g_ptr_array_unref);
 
   if (self->deactivating)
     {
@@ -197,9 +282,9 @@ gxfpnav_op_done (GObject *source, GAsyncResult *result, gpointer user_data)
 
     case GXFPNAV_OP_CAPTURE:
       {
-        FpImage *img = fp_image_new (GXFPNAV_IMG_W, GXFPNAV_IMG_H);
+        FpImage *img = fp_image_new (GXFPNAV_IMG_W, self->image_height);
 
-        memcpy (img->data, self->image, sizeof (self->image));
+        memcpy (img->data, self->image, (size_t) GXFPNAV_IMG_W * self->image_height);
         fpi_image_device_image_captured (dev, img);
       }
       break;
@@ -222,6 +307,9 @@ gxfpnav_start_op (FpiDeviceGxfpNav *self, enum gxfpnav_op op)
     }
 
   g_return_if_fail (!self->op_running);
+
+  if (op == GXFPNAV_OP_CAPTURE)
+    gxfpnav_collect_templates (self);
 
   g_clear_object (&self->cancellable);
   self->cancellable = g_cancellable_new ();
@@ -362,6 +450,7 @@ fpi_device_gxfpnav_dispose (GObject *object)
   FpiDeviceGxfpNav *self = FPI_DEVICE_GXFPNAV (object);
 
   g_clear_object (&self->cancellable);
+  g_clear_pointer (&self->templates, g_ptr_array_unref);
   G_OBJECT_CLASS (fpi_device_gxfpnav_parent_class)->dispose (object);
 }
 

@@ -39,7 +39,8 @@
 #define RESET_SENSOR 0x05u
 #define CFG_REPLY_MS 1000
 #define NAV_REPLY_MS 800
-#define QUIET_MS 50
+#define QUIET_MS 50		/* init, calibration and any unexpected state */
+#define QUIET_FAST_MS 5		/* measured on HW: sweeps stay correct, with no stale frames */
 #define QUIESCE_MAX_MS 3000
 #define XFER_TRIES 3
 #define OVERLAP_MIN 0.90
@@ -66,7 +67,7 @@ static long mono_ms(void)
 }
 
 /* Without an IRQ ack, copies of the previous response linger: wait for bus silence. */
-static int quiesce(struct gxfp_dev *dev)
+static int quiesce_ms(struct gxfp_dev *dev, int quiet_ms)
 {
 	long start = mono_ms();
 
@@ -75,7 +76,7 @@ static int quiesce(struct gxfp_dev *dev)
 
 		if (rc)
 			return rc;
-		rc = gxfp_dev_poll_readable(dev, QUIET_MS);
+		rc = gxfp_dev_poll_readable(dev, quiet_ms);
 		if (rc == -EAGAIN)
 			return 0;
 		if (rc)
@@ -86,10 +87,10 @@ static int quiesce(struct gxfp_dev *dev)
 	}
 }
 
-#define QUIET_XFER(dev, rc, call)					\
+#define QUIET_XFER_MS(dev, quiet_ms, rc, call)				\
 	do {								\
 		for (int try_ = 0; try_ < XFER_TRIES; try_++) {		\
-			(rc) = quiesce(dev);				\
+			(rc) = quiesce_ms(dev, quiet_ms);		\
 			if (rc)						\
 				break;					\
 			(rc) = (call);					\
@@ -97,6 +98,8 @@ static int quiesce(struct gxfp_dev *dev)
 				break;					\
 		}							\
 	} while (0)
+
+#define QUIET_XFER(dev, rc, call) QUIET_XFER_MS(dev, QUIET_MS, rc, call)
 
 static int read_exact(const char *path, void *buf, size_t want)
 {
@@ -196,18 +199,22 @@ static int send_config(struct gxfpnav_core *c, uint8_t ll)
 	uint8_t cfg[GXFPNAV_CFG_LEN];
 	uint32_t rx_len = 0;
 	uint16_t ck;
-	int rc = quiesce(&c->dev);
+	int rc = quiesce_ms(&c->dev, c->quiet_ms);
 
 	if (rc)
 		return rc;
+	c->cur_ll = 0;
 	memcpy(cfg, c->cfg, sizeof(cfg));
 	cfg[CFG_OFF_NAV_62] = ll;
 	ck = cfg_checksum(cfg);
 	cfg[0xFE] = (uint8_t)ck;
 	cfg[0xFF] = (uint8_t)(ck >> 8);
-	return gxfp_goodix_request_selected(&c->dev, GXFP_CMD_UPLOAD_CONFIG_MCU,
-					    GXFP_CMD_UPLOAD_CONFIG_MCU, cfg, sizeof(cfg),
-					    rx, sizeof(rx), &rx_len, 1, CFG_REPLY_MS, NULL, NULL);
+	rc = gxfp_goodix_request_selected(&c->dev, GXFP_CMD_UPLOAD_CONFIG_MCU,
+					  GXFP_CMD_UPLOAD_CONFIG_MCU, cfg, sizeof(cfg),
+					  rx, sizeof(rx), &rx_len, 1, CFG_REPLY_MS, NULL, NULL);
+	if (!rc)
+		c->cur_ll = ll;
+	return rc;
 }
 
 /* CRC-32/MPEG-2. */
@@ -224,7 +231,7 @@ static uint32_t frame_crc(const uint8_t *d, size_t n)
 }
 
 /* One unpacked NAV frame (6 bytes -> 4 pixels). -EAGAIN if it arrives damaged. */
-static int nav_frame(struct gxfpnav_core *c, uint16_t *px)
+static int nav_frame(struct gxfpnav_core *c, uint16_t *px, uint8_t *crc_out)
 {
 	static uint8_t pl[GXFP_MP_FRAME_MAX];
 	const uint8_t *body = pl + NAV_HDR;
@@ -232,7 +239,8 @@ static int nav_frame(struct gxfpnav_core *c, uint16_t *px)
 	uint32_t tail;
 	int rc;
 
-	QUIET_XFER(&c->dev, rc, gxfp_cmd_nav_frame(&c->dev, 1, NAV_REPLY_MS, pl, sizeof(pl), &len));
+	QUIET_XFER_MS(&c->dev, c->quiet_ms, rc,
+		      gxfp_cmd_nav_frame(&c->dev, 1, NAV_REPLY_MS, pl, sizeof(pl), &len));
 	if (rc)
 		return rc;
 	if (len != NAV_PAYLOAD)
@@ -241,6 +249,12 @@ static int nav_frame(struct gxfpnav_core *c, uint16_t *px)
 	       ((uint32_t)body[NAV_PIXEL_BYTES] << 8) | (uint32_t)body[NAV_PIXEL_BYTES + 1];
 	if (tail != frame_crc(body, NAV_PIXEL_BYTES))
 		return -EAGAIN;
+	if (crc_out) {
+		crc_out[0] = (uint8_t)(tail >> 24);
+		crc_out[1] = (uint8_t)(tail >> 16);
+		crc_out[2] = (uint8_t)(tail >> 8);
+		crc_out[3] = (uint8_t)tail;
+	}
 
 	for (int r = 0; r < ROWS; r++) {
 		const uint8_t *row = body + (size_t)r * 198u;
@@ -255,21 +269,6 @@ static int nav_frame(struct gxfpnav_core *c, uint16_t *px)
 			o[3] = (uint16_t)((b[4] << 4) | (b[5] >> 4));
 		}
 	}
-	return 0;
-}
-
-int gxfpnav_finger_delta(struct gxfpnav_core *c, double *out_delta)
-{
-	static uint16_t px[ROWS * COLS];
-	const float *ref = c->ref + (size_t)IDX_ORIG * ROWS * COLS;
-	double sum = 0;
-	int rc = nav_frame(c, px);
-
-	if (rc)
-		return rc;
-	for (int i = 0; i < ROWS * COLS; i++)
-		sum += (double)px[i] - ref[i];
-	*out_delta = sum / (ROWS * COLS);
 	return 0;
 }
 
@@ -305,6 +304,64 @@ static double corr(const float *a, const float *b, int n)
 	return (da > 0 && db > 0) ? num / sqrt(da * db) : 0;
 }
 
+static int val_index(uint8_t ll)
+{
+	for (int v = 0; v < GXFPNAV_NUM_VALS; v++) {
+		if (VALS[v] == ll)
+			return v;
+	}
+	return -1;
+}
+
+int gxfpnav_detect_begin(struct gxfpnav_core *c)
+{
+	c->det_valid = 0;
+	return c->cur_ll == LL_ORIG ? 0 : send_config(c, LL_ORIG);
+}
+
+int gxfpnav_finger_delta(struct gxfpnav_core *c, double *out_delta, double *out_corr)
+{
+	static uint16_t px[ROWS * COLS];
+	float *tex = malloc(ROWS * COLS * sizeof(float));
+	uint8_t crc[4];
+	int idx, rc;
+	const float *ref;
+	double sum = 0;
+
+	if (!tex)
+		return -ENOMEM;
+	idx = val_index(c->cur_ll);
+	rc = idx < 0 ? send_config(c, LL_ORIG) : 0;
+	if (idx < 0)
+		idx = IDX_ORIG;
+	if (!rc)
+		rc = nav_frame(c, px, crc);
+	if (!rc && c->det_valid && !memcmp(crc, c->det_crc, sizeof(crc)))
+		rc = -EAGAIN;
+	if (rc) {
+		free(tex);
+		return rc;
+	}
+	ref = c->ref + (size_t)idx * ROWS * COLS;
+	for (int r = 0; r < ROWS; r++) {
+		float row[COLS];
+
+		for (int i = 0; i < COLS; i++) {
+			row[i] = (float)px[r * COLS + i] - ref[r * COLS + i];
+			sum += row[i];
+		}
+		texture(row, tex + r * COLS);
+	}
+	*out_delta = sum / (ROWS * COLS);
+	*out_corr = c->det_valid ? corr(tex, c->det_tex, ROWS * COLS) : 0;
+	memcpy(c->det_tex, tex, ROWS * COLS * sizeof(float));
+	memcpy(c->det_frame, px, sizeof(px));
+	memcpy(c->det_crc, crc, sizeof(crc));
+	c->det_valid = 1;
+	free(tex);
+	return 0;
+}
+
 static int cmp_float(const void *a, const void *b)
 {
 	float x = *(const float *)a, y = *(const float *)b;
@@ -328,13 +385,13 @@ static int reflect101(int i, int n)
 }
 
 /* Removes the background with a Gaussian filter and scales percentiles 1..99 to 8 bits. */
-static int to_8bit(const float *src, uint8_t *dst)
+static int to_8bit(const float *src, uint8_t *dst, int W, int H)
 {
-	enum { W = GXFPNAV_IMG_W, H = GXFPNAV_IMG_H, N = W * H };
+	const int N = W * H;
 	double kernel[2 * HP_RADIUS + 1], total = 0;
-	float *tmp = malloc(N * sizeof(float));
-	float *hp = malloc(N * sizeof(float));
-	float *sorted = malloc(N * sizeof(float));
+	float *tmp = malloc((size_t)N * sizeof(float));
+	float *hp = malloc((size_t)N * sizeof(float));
+	float *sorted = malloc((size_t)N * sizeof(float));
 	float lo, hi;
 	int rc = 0;
 
@@ -367,8 +424,8 @@ static int to_8bit(const float *src, uint8_t *dst)
 			hp[y * W + x] = src[y * W + x] - (float)s;
 		}
 	}
-	memcpy(sorted, hp, N * sizeof(float));
-	qsort(sorted, N, sizeof(float), cmp_float);
+	memcpy(sorted, hp, (size_t)N * sizeof(float));
+	qsort(sorted, (size_t)N, sizeof(float), cmp_float);
 	lo = percentile(sorted, N, 1.0);
 	hi = percentile(sorted, N, 99.0);
 	if (hi <= lo) {
@@ -438,7 +495,7 @@ static int assemble(struct gxfpnav_core *c, const uint16_t *frames, uint8_t *img
 			crop[y * GXFPNAV_IMG_W + x] = lines[y * COLS + x + TEX_TRIM] / seen[y];
 	}
 	*out_overlap = n_corr ? sum_corr / n_corr : 0;
-	rc = *out_overlap < OVERLAP_MIN ? -EAGAIN : to_8bit(crop, img);
+	rc = *out_overlap < OVERLAP_MIN ? -EAGAIN : to_8bit(crop, img, GXFPNAV_IMG_W, LINES);
 out:
 	free(diff);
 	free(lines);
@@ -446,27 +503,130 @@ out:
 	return rc;
 }
 
-int gxfpnav_capture(struct gxfpnav_core *c, uint8_t *img, double *out_overlap,
-		    gxfpnav_cancel_fn cancel, void *ctx)
+/*
+ * Image from a subset of the frames. Gaps between the lines read are filled per column
+ * with a Catmull-Rom spline, enough for ridges sampled every 2 lines.
+ */
+static int build_partial(struct gxfpnav_core *c, const uint16_t *frames, const int *have, uint8_t *img,
+			 int *out_height)
+{
+	enum { LINES = GXFPNAV_IMG_H, W = GXFPNAV_IMG_W };
+	float *lines = calloc(LINES * COLS, sizeof(float));
+	float *crop = malloc(LINES * W * sizeof(float));
+	int seen[LINES], ys[LINES], n = 0, h, step, rc = 0;
+
+	if (!lines || !crop) {
+		rc = -ENOMEM;
+		goto out;
+	}
+	memset(seen, 0, sizeof(seen));
+	for (int v = 0; v < GXFPNAV_NUM_VALS; v++) {
+		if (!have[v])
+			continue;
+		for (int r = 0; r < ROWS; r++) {
+			const uint16_t *f = frames + ((size_t)v * ROWS + r) * COLS;
+			const float *ref = c->ref + ((size_t)v * ROWS + r) * COLS;
+			int line = VALS[v] + LINE_STEP * r - LINE_FIRST;
+
+			for (int i = 0; i < COLS; i++)
+				lines[line * COLS + i] += (float)f[i] - ref[i];
+			seen[line]++;
+		}
+	}
+	for (int y = 0; y < LINES; y++) {
+		if (!seen[y])
+			continue;
+		for (int i = 0; i < COLS; i++)
+			lines[y * COLS + i] /= seen[y];
+		ys[n++] = y;
+	}
+	if (n < 2) {
+		rc = -EIO;
+		goto out;
+	}
+	step = ys[1] - ys[0];
+	for (int i = 1; i < n; i++) {
+		if (ys[i] - ys[i - 1] != step) {
+			rc = -EIO;
+			goto out;
+		}
+	}
+	h = ys[n - 1] - ys[0] + 1;
+	for (int y = 0; y < h; y++) {
+		int i = y / step;
+		float t;
+		const float *p0, *p1, *p2, *p3;
+
+		if (i > n - 2)
+			i = n - 2;
+		t = (float)(y - i * step) / (float)step;
+		p0 = lines + (size_t)ys[i > 0 ? i - 1 : 0] * COLS + TEX_TRIM;
+		p1 = lines + (size_t)ys[i] * COLS + TEX_TRIM;
+		p2 = lines + (size_t)ys[i + 1] * COLS + TEX_TRIM;
+		p3 = lines + (size_t)ys[i + 2 < n ? i + 2 : n - 1] * COLS + TEX_TRIM;
+		for (int x = 0; x < W; x++)
+			crop[y * W + x] = 0.5f * (2 * p1[x] + (p2[x] - p0[x]) * t +
+						  (2 * p0[x] - 5 * p1[x] + 4 * p2[x] - p3[x]) * t * t +
+						  (3 * p1[x] - p0[x] - 3 * p2[x] + p3[x]) * t * t * t);
+	}
+	*out_height = h;
+	rc = to_8bit(crop, img, W, h);
+out:
+	free(lines);
+	free(crop);
+	return rc;
+}
+
+/* Masks over VALS. Levels add frames: 0x0A + 0x08, then 0x09 + 0x0B, then the rest. */
+static const uint8_t LEVEL_VALS[3] = { 0x05, 0x0F, 0xFF };
+
+int gxfpnav_capture(struct gxfpnav_core *c, uint8_t *img, int *out_height, double *out_overlap,
+		    gxfpnav_accept_fn accept, void *accept_ctx, gxfpnav_cancel_fn cancel, void *ctx)
 {
 	uint16_t *frames = malloc(GXFPNAV_NUM_VALS * ROWS * COLS * sizeof(uint16_t));
-	int rc = 0, restore;
+	int have[GXFPNAV_NUM_VALS] = { 0 };
+	int rc = 0;
 
 	if (!frames)
 		return -ENOMEM;
-	for (int v = 0; v < GXFPNAV_NUM_VALS && !rc; v++) {
-		if (cancel && cancel(ctx))
-			rc = -ECANCELED;
-		if (!rc)
-			rc = send_config(c, VALS[v]);
-		if (!rc)
-			rc = nav_frame(c, frames + (size_t)v * ROWS * COLS);
+	*out_overlap = 0;
+	if (accept && c->det_valid && c->cur_ll == LL_ORIG) {
+		memcpy(frames + (size_t)IDX_ORIG * ROWS * COLS, c->det_frame,
+		       ROWS * COLS * sizeof(uint16_t));
+		have[IDX_ORIG] = 1;
 	}
-	restore = send_config(c, LL_ORIG);
-	if (!rc)
-		rc = assemble(c, frames, img, out_overlap);
+	c->det_valid = 0;
+
+	for (int level = accept ? 0 : 2; level < 3 && !rc; level++) {
+		for (int v = 0; v < GXFPNAV_NUM_VALS && !rc; v++) {
+			if (!(LEVEL_VALS[level] & (1u << v)) || have[v])
+				continue;
+			if (cancel && cancel(ctx))
+				rc = -ECANCELED;
+			if (!rc)
+				rc = send_config(c, VALS[v]);
+			if (!rc)
+				rc = nav_frame(c, frames + (size_t)v * ROWS * COLS, NULL);
+			if (!rc)
+				have[v] = 1;
+		}
+		if (rc)
+			break;
+		if (level == 2) {
+			*out_height = GXFPNAV_IMG_H;
+			rc = assemble(c, frames, img, out_overlap);
+			break;
+		}
+		rc = build_partial(c, frames, have, img, out_height);
+		if (rc == -EAGAIN) {
+			rc = 0;		/* flat image: not enough to decide, keep reading */
+			continue;
+		}
+		if (!rc && accept(img, GXFPNAV_IMG_W, *out_height, level + 1, accept_ctx))
+			break;
+	}
 	free(frames);
-	return rc ? rc : restore;
+	return rc;
 }
 
 int gxfpnav_sensor_init(struct gxfpnav_core *c)
@@ -477,6 +637,9 @@ int gxfpnav_sensor_init(struct gxfpnav_core *c)
 	uint32_t chip;
 	int rc;
 
+	c->quiet_ms = QUIET_MS;
+	c->cur_ll = 0;
+	c->det_valid = 0;
 	QUIET_XFER(&c->dev, rc, gxfp_cmd_reset_device(&c->dev, RESET_SENSOR));
 	if (rc)
 		return rc;
@@ -495,6 +658,8 @@ int gxfpnav_sensor_init(struct gxfpnav_core *c)
 		rc = check_otp_cfg(otp_live, c->cfg);
 	if (!rc)
 		rc = send_config(c, LL_ORIG);
+	if (!rc)
+		c->quiet_ms = QUIET_FAST_MS;
 	return rc;
 }
 
@@ -505,8 +670,12 @@ int gxfpnav_open(struct gxfpnav_core *c, const char *dev_path, const char *cfg_p
 
 	memset(c, 0, sizeof(*c));
 	c->ref = malloc(REF_PIXELS * sizeof(float));
-	if (!c->ref)
+	c->det_frame = malloc(ROWS * COLS * sizeof(uint16_t));
+	c->det_tex = malloc(ROWS * COLS * sizeof(float));
+	if (!c->ref || !c->det_frame || !c->det_tex) {
+		gxfpnav_close(c);
 		return -ENOMEM;
+	}
 	rc = read_exact(cfg_path, c->cfg, GXFPNAV_CFG_LEN);
 	if (!rc)
 		rc = check_cfg(c->cfg);
@@ -533,6 +702,10 @@ void gxfpnav_close(struct gxfpnav_core *c)
 	c->dev_open = 0;
 	free(c->ref);
 	c->ref = NULL;
+	free(c->det_frame);
+	c->det_frame = NULL;
+	free(c->det_tex);
+	c->det_tex = NULL;
 }
 
 static int patch_reg(uint8_t *cfg, unsigned int off, unsigned int len, uint16_t reg,
@@ -636,7 +809,7 @@ static int nav_frame_retry(struct gxfpnav_core *c, uint16_t *px)
 	int rc = -EAGAIN;
 
 	for (int i = 0; i < REF_FRAME_TRIES && rc == -EAGAIN; i++)
-		rc = nav_frame(c, px);
+		rc = nav_frame(c, px, NULL);
 	return rc;
 }
 
@@ -696,6 +869,7 @@ int gxfpnav_calibrate(const char *dev_path, const uint8_t *tpl, uint8_t *cfg, co
 	int rc, restore;
 
 	memset(&c, 0, sizeof(c));
+	c.quiet_ms = QUIET_MS;
 	c.ref = malloc(REF_PIXELS * sizeof(float));
 	if (!c.ref)
 		return -ENOMEM;

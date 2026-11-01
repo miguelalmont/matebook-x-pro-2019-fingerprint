@@ -59,6 +59,13 @@ void sigfm_free_info(SigfmImgInfo* info);
 int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled);
 
 /**
+ * @brief Same score, but counting stops once it reaches limit (limit <= 0: no limit)
+ *
+ * @return The score, capped at limit; negative on error
+ */
+int sigfm_match_score_limit(SigfmImgInfo* frame, SigfmImgInfo* enrolled, int limit);
+
+/**
  * @brief Serialize an image info for storage
  *
  * @param info SigfmImgInfo to store

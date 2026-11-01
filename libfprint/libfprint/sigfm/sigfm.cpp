@@ -28,6 +28,7 @@
 #include "opencv2/features2d.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -134,7 +135,7 @@ SigfmImgInfo* sigfm_extract(const SigfmPix* pix, int width, int height)
     return info;
 }
 
-int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
+int sigfm_match_score_limit(SigfmImgInfo* frame, SigfmImgInfo* enrolled, int limit)
 {
     try {
         std::vector<std::vector<cv::DMatch>> points;
@@ -199,7 +200,8 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
             return 0;
         }
 
-        int count = 0;
+        // Stopping at the limit cannot change a "score >= limit" decision.
+        long long count = 0;
         for (std::size_t j = 0; j < angles.size(); j++) {
             angle angle_1 = angles[j];
             for (std::size_t k = j + 1; k < angles.size(); k++) {
@@ -209,14 +211,22 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
                     std::fabs(angle_1.cos - angle_2.cos) <= angle_tol_rad) {
 
                     count += 1;
+                    if (limit > 0 && count >= limit) {
+                        return limit;
+                    }
                 }
             }
         }
-        return count;
+        return static_cast<int>(std::min<long long>(count, INT_MAX));
     }
     catch (...) {
         return -1;
     }
+}
+
+int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
+{
+    return sigfm_match_score_limit(frame, enrolled, 0);
 }
 
 void sigfm_free_info(SigfmImgInfo* info) { delete info; }
