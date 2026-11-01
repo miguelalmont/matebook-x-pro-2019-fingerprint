@@ -33,8 +33,12 @@
 
 #define GXFPNAV_ENROLL_SAMPLES 10
 #define GXFPNAV_DATA_DIR "/var/lib/fprint/gxfpnav"
+/* While waiting, each NAV frame costs CPU in the IRQ thread: poll fast only when it helps. */
 #define GXFPNAV_POLL_DOWN_US 20000
+#define GXFPNAV_POLL_IDLE_US 200000
+#define GXFPNAV_POLL_FAST_FOR_US (10 * G_USEC_PER_SEC)
 #define GXFPNAV_POLL_UP_US 100000
+#define GXFPNAV_POLL_SLICE_US 20000
 #define GXFPNAV_FINGER_DOWN (-200.0)	/* mean difference: about -500 counts with a finger */
 #define GXFPNAV_FINGER_UP (-80.0)
 #define GXFPNAV_DOWN_STABLE 2
@@ -78,10 +82,18 @@ gxfpnav_is_cancelled (void *ctx)
   return g_cancellable_is_cancelled (G_CANCELLABLE (ctx));
 }
 
+static void
+gxfpnav_sleep (GCancellable *cancellable, gint64 us)
+{
+  for (; us > 0 && !g_cancellable_is_cancelled (cancellable); us -= GXFPNAV_POLL_SLICE_US)
+    g_usleep (MIN (us, GXFPNAV_POLL_SLICE_US));
+}
+
 static int
 gxfpnav_wait_finger (FpiDeviceGxfpNav *self, GCancellable *cancellable, gboolean down)
 {
   int stable = 0;
+  gint64 start = g_get_monotonic_time ();
   int r = down ? gxfpnav_detect_begin (&self->core) : 0;
 
   if (r < 0)
@@ -109,7 +121,13 @@ gxfpnav_wait_finger (FpiDeviceGxfpNav *self, GCancellable *cancellable, gboolean
           return 0;
         }
 
-      g_usleep (down ? GXFPNAV_POLL_DOWN_US : GXFPNAV_POLL_UP_US);
+      /* A finger on the sensor, or a recent prompt: the user is about to be waiting. */
+      if (!down)
+        gxfpnav_sleep (cancellable, GXFPNAV_POLL_UP_US);
+      else if (delta < GXFPNAV_FINGER_DOWN || g_get_monotonic_time () - start < GXFPNAV_POLL_FAST_FOR_US)
+        gxfpnav_sleep (cancellable, GXFPNAV_POLL_DOWN_US);
+      else
+        gxfpnav_sleep (cancellable, GXFPNAV_POLL_IDLE_US);
     }
   return -ECANCELED;
 }

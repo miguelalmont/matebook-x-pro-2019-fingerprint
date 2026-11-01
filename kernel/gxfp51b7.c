@@ -19,8 +19,10 @@
  * functions 3 and 4 (ECMD 0xF1/0xF2) are not advertised by function 0, and their
  * guard checks \_SB.PCI0.LPCB.H_EC.ECMD, a name absent from the DSDT, so they are
  * no-ops. Without an ack the IRQ thread runs many times per response (about 131
- * for a 0xA8). This only costs CPU: the EC leaves a sequence of frames in the
- * window, the driver queues them all and userspace filters by command. Masking
+ * for a 0xA8). The EC leaves a sequence of frames in the window, the driver
+ * queues them all and userspace filters by command. To limit the CPU cost, each
+ * run reads only the frame in the window and then pauses, keeping the sampling
+ * interval of the earlier whole-window read (about 0.7 ms). Masking
  * the IRQ or deduplicating here was tried on hardware and does not work: masking
  * suppresses the firings that carry the response, and this driver does not know
  * which frame is the expected one.
@@ -89,6 +91,13 @@ static const guid_t gxfp_dsm_guid =
 /* Settle time after publishing a TX and ringing the doorbell. */
 #define GXFP_DOORBELL_SETTLE_US	200
 
+/* Pause after each snapshot. The IRQ stays masked, so a level line re-fires after it. */
+#define GXFP_IRQ_PAUSE_MIN_US	500
+#define GXFP_IRQ_PAUSE_MAX_US	700
+
+/* Enough to hold the MP header, which gives the length of the frame. */
+#define GXFP_RX_HEAD_LEN	sizeof(u64)
+
 struct gxfp {
 	struct device *dev;
 	acpi_handle handle;
@@ -135,12 +144,12 @@ static void gxfp_write_tx(struct gxfp *g, size_t len)
 		       g->window + GXFP_TX_OFFSET + offset);
 }
 
-static void gxfp_read_rx(struct gxfp *g, size_t len)
+static void gxfp_read_rx(struct gxfp *g, size_t from, size_t len)
 {
 	size_t offset;
 
 	len = ALIGN(min_t(size_t, len, GXFP_RX_REGION), sizeof(u64));
-	for (offset = 0; offset < len; offset += sizeof(u64))
+	for (offset = from; offset < len; offset += sizeof(u64))
 		put_unaligned_le64(readq(g->window + GXFP_RX_OFFSET + offset),
 				   g->rx_buf + offset);
 	/* Complete the mailbox snapshot before parsing it. */
@@ -217,11 +226,8 @@ static irqreturn_t gxfp_irq_thread(int irq, void *data)
 
 	(void)irq;
 
-	/* Full snapshot of the response ring. */
-	gxfp_read_rx(g, GXFP_RX_REGION);
-
 	if (!queue)
-		return IRQ_HANDLED;
+		goto out;
 
 	/*
 	 * Userspace reassembles the response from GXFP_RX_MAX-sized records, so
@@ -231,9 +237,13 @@ static irqreturn_t gxfp_irq_thread(int irq, void *data)
 	 * Every snapshot is queued and userspace filters by command: see the note
 	 * on the missing acknowledgement at the top of this file.
 	 */
+	gxfp_read_rx(g, 0, GXFP_RX_HEAD_LEN);
 	total = gxfp_rx_total_len(g->rx_buf);
 	if (total == 0 || total > GXFP_RX_REGION)
 		total = GXFP_RX_MAX;
+	gxfp_read_rx(g, GXFP_RX_HEAD_LEN, total);
+	/* Each record carries a full slot: do not expose what an older frame left there. */
+	memset(g->rx_buf + total, 0, roundup(total, GXFP_RX_MAX) - total);
 
 	spin_lock_irqsave(&g->rx_lock, flags);
 	for (done = 0; done < total; done += GXFP_RX_MAX) {
@@ -246,6 +256,8 @@ static irqreturn_t gxfp_irq_thread(int irq, void *data)
 	spin_unlock_irqrestore(&g->rx_lock, flags);
 
 	wake_up_interruptible(&g->rx_wait);
+out:
+	usleep_range(GXFP_IRQ_PAUSE_MIN_US, GXFP_IRQ_PAUSE_MAX_US);
 	return IRQ_HANDLED;
 }
 
