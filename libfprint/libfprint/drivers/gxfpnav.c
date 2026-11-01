@@ -43,9 +43,11 @@
 #define GXFPNAV_FINGER_UP (-80.0)
 #define GXFPNAV_DOWN_STABLE 2
 #define GXFPNAV_SETTLED_CORR 0.99	/* between frames: measured 0.93 at contact, 0.999 after */
-/* Provisional. SIGFM scores k coherent matches as about k^4/8: 94395 is 30, 1000 is 10. */
+/* SIGFM scores k coherent matches as about k^4/8: 94395 is 30, 1000 is 10. Highest impostor
+ * score measured in 11400 attempts by 2 people: 40, which the default threshold accepts. */
 #define GXFPNAV_ACCEPT_LEVEL1 94395
 #define GXFPNAV_ACCEPT_LEVEL2 1000
+#define GXFPNAV_ACCEPT_FINAL 1000
 
 enum gxfpnav_op {
   GXFPNAV_OP_NONE,
@@ -499,6 +501,7 @@ fpi_device_gxfpnav_class_init (FpiDeviceGxfpNavClass *klass)
   img_class->img_width = GXFPNAV_IMG_W;
   img_class->img_height = GXFPNAV_IMG_H;
   img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
+  img_class->bz3_threshold = GXFPNAV_ACCEPT_FINAL;
 
   img_class->img_open = gxfpnav_img_open;
   img_class->img_close = gxfpnav_img_close;

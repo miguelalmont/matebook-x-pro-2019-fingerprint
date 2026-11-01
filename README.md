@@ -155,9 +155,18 @@ A fingerprint here is a **convenience, not a strong security boundary**.
 - **The sensor is not authenticated.** Images travel in the clear and the link is not
   encrypted, unlike on Windows. Software with root or kernel access could read them or
   feed in fake images. An attacker with that access already controls the system.
-- **Accuracy has barely been measured.** The test set was 2 fingers of one person in
-  one session: 16 of 16 genuine attempts accepted and 0 of 16 impostor attempts accepted.
-  That is too small to give error rates. Treat the false acceptance rate as unknown.
+- **Accuracy has been measured on a small set, offline.** The set was 600 touches of 20
+  fingers from 2 people, scored with this driver's code against prints built from 10 touches:
+  - Impostors: 0 of 11,400 attempts accepted, 6,000 of them between the 2 people. The highest
+    score was 40, against a threshold of 1000. With the default threshold of 40, that attempt
+    would have been accepted, which is why this driver raises it.
+  - Genuine, one person, across 2 sessions on the same day: 90.5 % accepted on the first
+    touch. About 5 % were asked to touch again and about 5 % were rejected. One finger
+    accounts for many of the failures.
+  - Genuine, the other person, within one session: 92 of 100 accepted on the first touch.
+
+  Two people are too few to give a false acceptance rate, so treat it as unknown. Sessions on
+  different days, dry or wet fingers and other sensors have not been measured.
 - **No liveness detection** was tested. Assume that a good copy of a fingerprint could work.
 - **Enrolled fingerprints are stored on the disk**, unencrypted unless the disk is, in
   `/var/lib/fprint`, readable only by root. They do not stay in the sensor or in SGX as on
@@ -175,7 +184,7 @@ A fingerprint here is a **convenience, not a strong security boundary**.
   about 1.7 s for a rejection. Lifting the finger earlier can report that it was not centered.
   Enrolling always reads the full image, which takes about 1.5 s per touch.
 - To be fast, verification accepts a partial image when the match is very strong. Those
-  thresholds are provisional and have only been checked with the fingers of one person.
+  thresholds have only been checked with the fingers of 2 people.
 - While waiting for a finger, the sensor is polled. Together, the interrupt thread and
   `fprintd` were measured at about 10 % of one CPU thread for the first 10 seconds and about
   4 % afterwards, with about 240 interrupts per second.
